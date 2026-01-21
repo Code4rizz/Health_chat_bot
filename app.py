@@ -10,14 +10,31 @@ from agno.models.groq import Groq
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 
-
-
 load_dotenv()
 st.set_page_config(page_title="Health Agent", page_icon="🏥")
 st.title("🏥 Health Agent")
 
 
+# =========================
+# 🔹 Conversational Memory
+# =========================
+def get_chat_memory(max_messages=10):
+    if "messages" not in st.session_state:
+        return ""
 
+    history = st.session_state.messages[-max_messages:]
+    memory = []
+
+    for msg in history:
+        role = "User" if msg["role"] == "user" else "Assistant"
+        memory.append(f"{role}: {msg['content']}")
+
+    return "\n".join(memory)
+
+
+# =========================
+# 🔹 Vector DB
+# =========================
 @st.cache_resource
 def load_vector_db():
     embeddings = HuggingFaceEmbeddings(
@@ -32,14 +49,18 @@ def load_vector_db():
 db = load_vector_db()
 
 
-
+# =========================
+# 🔹 LLM
+# =========================
 groq_model = Groq(
     id="llama-3.1-8b-instant",
     api_key=os.getenv("GROQ_API_KEY")
 )
 
 
-
+# =========================
+# 🔹 Tools
+# =========================
 def bmi_tool(weight_kg: float, height_cm: float) -> dict:
     if weight_kg <= 0 or height_cm <= 0:
         return {"error": "Weight and height must be positive numbers."}
@@ -59,7 +80,9 @@ def bmi_tool(weight_kg: float, height_cm: float) -> dict:
     return {"bmi": round(bmi, 1), "category": category}
 
 
-
+# =========================
+# 🔹 Agents
+# =========================
 classifier_agent = Agent(
     model=groq_model,
     instructions="""
@@ -81,20 +104,9 @@ You are a helpful general-purpose assistant.
 Rules:
 - Answer questions that are NOT related to health or medicine.
 - Provide clear, accurate, and concise explanations.
-- If the question is factual, give a direct answer first, then brief context if helpful.
-- If the question is opinion-based, present a balanced and neutral view.
-- Do NOT provide medical, health, or diagnostic advice.
-- If a question seems health-related, answer briefly at a high level
-  and avoid giving medical guidance.
-
-Style:
-- Be polite, calm, and confident.
-- Avoid unnecessary disclaimers.
-- Keep responses easy to understand.
+- Do NOT provide medical advice.
 """
 )
-
-
 
 health_agent = Agent(
     model=groq_model,
@@ -102,55 +114,30 @@ health_agent = Agent(
     instructions="""
 You are a professional doctor.
 
-General rules:
+Rules:
 - Provide general medical guidance only.
 - Do NOT diagnose diseases.
 - Do NOT give emergency instructions.
-
-CRITICAL TOOL RULES (IMPORTANT):
-- You MUST NOT call the bmi_tool unless BMI calculation is explicitly required.
-- ONLY call bmi_tool when:
-  (a) the user explicitly asks to calculate BMI, OR
-  (b) the user asks for a health judgement that requires BMI
-      AND weight (kg) and height (cm) are provided.
-- NEVER call bmi_tool for hydration, sleep, exercise, diet,
-  or any general health advice.
-- If BMI is already provided, DO NOT call bmi_tool.
-
-BMI rules:
-- BMI calculation requires weight in kilograms (kg)
-  and height in centimeters (cm).
-- If required values are missing or unclear, ask the user
-  to provide them. Do NOT guess.
-
-Context rules:
-- You may receive reference information.
-- Use it ONLY if relevant.
-- If no reference is provided, answer normally.
-
-Output rules:
-- Do NOT mention tools, function calls, or internal steps.
-- Respond with plain natural language only.
-
-Be clear, practical, and concise.
 """
 )
 
 
-
+# =========================
+# 🔹 Helpers
+# =========================
 def extract_weight_height_cm(text):
     nums = [float(x) for x in re.findall(r"\d+\.?\d*", text)]
     if len(nums) < 2:
         return None, None
 
     weight, height = nums[:2]
-    if height < 50:  
+    if height < 50:
         return None, None
 
     return weight, height
 
 
-def retrieve_context(query, max_distance=1.0):  
+def retrieve_context(query, max_distance=1.0):
     results = db.similarity_search_with_score(query, k=1)
     if not results:
         return None, None
@@ -169,43 +156,45 @@ def retrieve_context(query, max_distance=1.0):
     return context, source
 
 
-
+# =========================
+# 🔹 Health Handler (WITH MEMORY)
+# =========================
 def handle_health(query):
+    memory = get_chat_memory()
     lower = query.lower()
 
-  
     if "bmi" in lower and len(re.findall(r"\d+\.?\d*", query)) == 1:
-        answer = health_agent.run(query).content
+        prompt = f"{memory}\n\n{query}"
+        answer = health_agent.run(prompt).content
         return "[AGENT: HEALTH]\n[DOCS USED: NO]\n\n" + answer
 
-    
     if any(x in lower for x in ["calculate bmi", "based on my bmi", "am i healthy"]):
         weight, height = extract_weight_height_cm(query)
 
         if not weight or not height:
             return (
                 "[AGENT: HEALTH]\n[DOCS USED: NO]\n\n"
-                "if your are trying to calculate your BMI, "
-                "Please provide your weight in kilograms (kg) "
-                "and height in centimeters (cm)."
+                "Please provide your weight (kg) and height (cm)."
             )
 
         result = bmi_tool(weight, height)
-        if "error" in result:
-            return "[AGENT: BMI]\n[DOCS USED: NO]\n\n" + result["error"]
-
         return (
             "[AGENT: BMI]\n[DOCS USED: NO]\n\n"
-            f"Your BMI is **{result['bmi']}**, which falls in the "
-            f"**{result['category']}** category.\n\n"
-            "Maintaining balanced nutrition, regular physical activity, "
-            "and good sleep habits supports overall health."
+            f"Your BMI is **{result['bmi']}** ({result['category']})."
         )
 
-   
     context, source = retrieve_context(query)
     if context:
-        prompt = f"{context}\n\nQuestion: {query}"
+        prompt = f"""
+Conversation so far:
+{memory}
+
+Medical reference:
+{context}
+
+User question:
+{query}
+"""
         answer = health_agent.run(prompt).content
         return (
             "[AGENT: HEALTH]\n"
@@ -214,26 +203,38 @@ def handle_health(query):
             + answer
         )
 
-
-    answer = health_agent.run(query).content
+    prompt = f"{memory}\n\n{query}"
+    answer = health_agent.run(prompt).content
     return "[AGENT: HEALTH]\n[DOCS USED: NO]\n\n" + answer
 
 
+# =========================
+# 🔹 Router (WITH MEMORY)
+# =========================
 def route_query(user_input):
-    result = classifier_agent.run(user_input).content
+    memory = get_chat_memory()
+
+    result = classifier_agent.run(
+        f"{memory}\n\n{user_input}"
+    ).content
+
     try:
         route = json.loads(result)["route"]
     except Exception:
         route = "GENERAL"
 
     if route == "GENERAL":
-        answer = general_agent.run(user_input).content
+        answer = general_agent.run(
+            f"{memory}\n\n{user_input}"
+        ).content
         return "[AGENT: GENERAL]\n[DOCS USED: NO]\n\n" + answer
 
     return handle_health(user_input)
 
 
-
+# =========================
+# 🔹 Streamlit UI
+# =========================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
